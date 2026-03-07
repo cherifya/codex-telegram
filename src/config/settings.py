@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, List, Literal, Optional
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.constants import (
@@ -60,35 +60,54 @@ class Settings(BaseSettings):
     )
     disable_tool_validation: bool = Field(
         False,
-        description="Allow all Claude tools by bypassing tool validation checks",
+        description="Allow all agent tools by bypassing tool validation checks",
     )
 
     # Claude settings
     claude_binary_path: Optional[str] = Field(
-        None, description="Path to Claude CLI binary (deprecated)"
+        None,
+        description="Path to Claude/Codex CLI binary (deprecated)",
+        validation_alias=AliasChoices("CLAUDE_BINARY_PATH", "CODEX_BINARY_PATH"),
     )
     claude_cli_path: Optional[str] = Field(
-        None, description="Path to Claude CLI executable"
+        None,
+        description="Path to Claude/Codex CLI executable",
+        validation_alias=AliasChoices("CLAUDE_CLI_PATH", "CODEX_CLI_PATH"),
     )
     anthropic_api_key: Optional[SecretStr] = Field(
         None,
         description="Anthropic API key for SDK (optional if CLI logged in)",
     )
     claude_model: Optional[str] = Field(
-        None, description="Claude model to use (defaults to CLI default if unset)"
+        None,
+        description="Model to use (defaults to CLI default if unset)",
+        validation_alias=AliasChoices("CLAUDE_MODEL", "CODEX_MODEL"),
     )
     claude_max_turns: int = Field(
-        DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns"
+        DEFAULT_CLAUDE_MAX_TURNS,
+        description="Max conversation turns",
+        validation_alias=AliasChoices("CLAUDE_MAX_TURNS", "CODEX_MAX_TURNS"),
     )
     claude_timeout_seconds: int = Field(
-        DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
+        DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+        description="Agent timeout",
+        validation_alias=AliasChoices(
+            "CLAUDE_TIMEOUT_SECONDS", "CODEX_TIMEOUT_SECONDS"
+        ),
     )
     claude_max_cost_per_user: float = Field(
-        DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
+        DEFAULT_CLAUDE_MAX_COST_PER_USER,
+        description="Max cost per user",
+        validation_alias=AliasChoices(
+            "CLAUDE_MAX_COST_PER_USER", "CODEX_MAX_COST_PER_USER"
+        ),
     )
     claude_max_cost_per_request: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
         description="Max cost per individual request (SDK budget cap)",
+        validation_alias=AliasChoices(
+            "CLAUDE_MAX_COST_PER_REQUEST", "CODEX_MAX_BUDGET_USD"
+        ),
     )
     # NOTE: When changing this list, also update docs/tools.md,
     # docs/configuration.md, .env.example,
@@ -115,10 +134,29 @@ class Settings(BaseSettings):
             "Skill",
         ],
         description="List of allowed Claude tools",
+        validation_alias=AliasChoices("CLAUDE_ALLOWED_TOOLS", "CODEX_ALLOWED_TOOLS"),
     )
     claude_disallowed_tools: Optional[List[str]] = Field(
         default=[],
         description="List of explicitly disallowed Claude tools/commands",
+        validation_alias=AliasChoices(
+            "CLAUDE_DISALLOWED_TOOLS", "CODEX_DISALLOWED_TOOLS"
+        ),
+    )
+    codex_home: Optional[Path] = Field(
+        None,
+        description="Optional CODEX_HOME override for Codex session state",
+        validation_alias=AliasChoices("CODEX_HOME"),
+    )
+    codex_extra_args: Optional[List[str]] = Field(
+        None,
+        description="Extra CLI flags to pass to codex exec",
+        validation_alias=AliasChoices("CODEX_EXTRA_ARGS"),
+    )
+    codex_yolo: bool = Field(
+        True,
+        description="Enable Codex YOLO mode (--yolo) for non-interactive execution",
+        validation_alias=AliasChoices("CODEX_YOLO"),
     )
 
     # Sandbox settings
@@ -284,7 +322,11 @@ class Settings(BaseSettings):
     )
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+        populate_by_name=True,
     )
 
     @field_validator("allowed_users", "notification_chat_ids", mode="before")
@@ -311,6 +353,28 @@ class Settings(BaseSettings):
             return [tool.strip() for tool in v.split(",") if tool.strip()]
         if isinstance(v, list):
             return [str(tool) for tool in v]
+        return v  # type: ignore[no-any-return]
+
+    @field_validator("codex_extra_args", mode="before")
+    @classmethod
+    def parse_codex_extra_args(cls, v: Any) -> Optional[List[str]]:
+        """Parse CODEX_EXTRA_ARGS from comma-separated or list values."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return [arg.strip() for arg in v.split(",") if arg.strip()]
+        if isinstance(v, list):
+            return [str(arg).strip() for arg in v if str(arg).strip()]
+        return v  # type: ignore[no-any-return]
+
+    @field_validator("codex_home", mode="before")
+    @classmethod
+    def normalize_codex_home(cls, v: Any) -> Optional[Path | str]:
+        """Treat blank CODEX_HOME as unset instead of Path('.')"""
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
         return v  # type: ignore[no-any-return]
 
     @field_validator("approved_directory")
@@ -485,6 +549,46 @@ class Settings(BaseSettings):
             if self.anthropic_api_key
             else None
         )
+
+    @property
+    def codex_cli_path(self) -> Optional[str]:
+        """Compatibility alias for codex-oriented code paths."""
+        return self.claude_cli_path
+
+    @property
+    def codex_model(self) -> Optional[str]:
+        """Compatibility alias for codex-oriented code paths."""
+        return self.claude_model
+
+    @property
+    def codex_max_turns(self) -> int:
+        """Compatibility alias for codex-oriented code paths."""
+        return self.claude_max_turns
+
+    @property
+    def codex_timeout_seconds(self) -> int:
+        """Compatibility alias for codex-oriented code paths."""
+        return self.claude_timeout_seconds
+
+    @property
+    def codex_max_cost_per_user(self) -> float:
+        """Compatibility alias for codex-oriented code paths."""
+        return self.claude_max_cost_per_user
+
+    @property
+    def codex_max_budget_usd(self) -> float:
+        """Compatibility alias for codex-oriented code paths."""
+        return self.claude_max_cost_per_request
+
+    @property
+    def codex_allowed_tools(self) -> Optional[List[str]]:
+        """Compatibility alias for codex-oriented code paths."""
+        return self.claude_allowed_tools
+
+    @property
+    def codex_disallowed_tools(self) -> Optional[List[str]]:
+        """Compatibility alias for codex-oriented code paths."""
+        return self.claude_disallowed_tools
 
     @property
     def mistral_api_key_str(self) -> Optional[str]:

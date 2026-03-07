@@ -1,4 +1,4 @@
-"""Main entry point for Claude Code Telegram Bot."""
+"""Main entry point for Codex Telegram Bot."""
 
 import argparse
 import asyncio
@@ -12,11 +12,11 @@ import structlog
 
 from src import __version__
 from src.bot.core import ClaudeCodeBot
-from src.claude import (
-    ClaudeIntegration,
+from src.codex import (
+    CodexIntegration,
     SessionManager,
 )
-from src.claude.sdk_integration import ClaudeSDKManager
+from src.codex.sdk_integration import CodexSDKManager
 from src.config.features import FeatureFlags
 from src.config.settings import Settings
 from src.events.bus import EventBus
@@ -77,12 +77,12 @@ def setup_logging(debug: bool = False) -> None:
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Claude Code Telegram Bot",
+        description="Codex Telegram Bot",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument(
-        "--version", action="version", version=f"Claude Code Telegram Bot {__version__}"
+        "--version", action="version", version=f"Codex Telegram Bot {__version__}"
     )
 
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -136,15 +136,15 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     audit_storage = InMemoryAuditStorage()  # TODO: Use database storage in production
     audit_logger = AuditLogger(audit_storage)
 
-    # Create Claude integration components with persistent storage
+    # Create Codex integration components with persistent storage
     session_storage = SQLiteSessionStorage(storage.db_manager)
     session_manager = SessionManager(config, session_storage)
 
-    # Create Claude SDK manager and integration facade
-    logger.info("Using Claude Python SDK integration")
-    sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
+    # Create Codex SDK manager behind the existing integration facade
+    logger.info("Using Codex CLI integration")
+    sdk_manager = CodexSDKManager(config, security_validator=security_validator)
 
-    claude_integration = ClaudeIntegration(
+    codex_integration = CodexIntegration(
         config=config,
         sdk_manager=sdk_manager,
         session_manager=session_manager,
@@ -161,10 +161,10 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
     event_security.register()
 
-    # Agent handler — translates events into Claude executions
+    # Agent handler — translates events into Codex executions
     agent_handler = AgentHandler(
         event_bus=event_bus,
-        claude_integration=claude_integration,
+        claude_integration=codex_integration,
         default_working_directory=config.approved_directory,
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
     )
@@ -176,7 +176,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "security_validator": security_validator,
         "rate_limiter": rate_limiter,
         "audit_logger": audit_logger,
-        "claude_integration": claude_integration,
+        "claude_integration": codex_integration,
+        "codex_integration": codex_integration,
         "storage": storage,
         "event_bus": event_bus,
         "project_registry": None,
@@ -193,7 +194,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     return {
         "bot": bot,
-        "claude_integration": claude_integration,
+        "claude_integration": codex_integration,
+        "codex_integration": codex_integration,
         "storage": storage,
         "config": config,
         "features": features,
@@ -208,7 +210,7 @@ async def run_application(app: Dict[str, Any]) -> None:
     """Run the application with graceful shutdown handling."""
     logger = structlog.get_logger()
     bot: ClaudeCodeBot = app["bot"]
-    claude_integration: ClaudeIntegration = app["claude_integration"]
+    codex_integration: CodexIntegration = app["codex_integration"]
     storage: Storage = app["storage"]
     config: Settings = app["config"]
     features: FeatureFlags = app["features"]
@@ -229,7 +231,7 @@ async def run_application(app: Dict[str, Any]) -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        logger.info("Starting Claude Code Telegram Bot")
+        logger.info("Starting Codex Telegram Bot")
 
         # Initialize the bot first (creates the Telegram Application)
         await bot.initialize()
@@ -358,7 +360,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                 await notification_service.stop()
             await event_bus.stop()
             await bot.stop()
-            await claude_integration.shutdown()
+            await codex_integration.shutdown()
             await storage.close()
         except Exception as e:
             logger.error("Error during shutdown", error=str(e))
@@ -372,7 +374,7 @@ async def main() -> None:
     setup_logging(debug=args.debug)
 
     logger = structlog.get_logger()
-    logger.info("Starting Claude Code Telegram Bot", version=__version__)
+    logger.info("Starting Codex Telegram Bot", version=__version__)
 
     try:
         # Load configuration
