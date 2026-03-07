@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("mcp")
+
 from src.mcp.telegram_server import send_image_to_user
 
 
