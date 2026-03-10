@@ -32,6 +32,7 @@ from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from ..utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
+from .execution_tracker import ExecutionTracker, scope_key_from_update
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
@@ -127,6 +128,37 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+
+    @staticmethod
+    def _format_duration(seconds: Optional[int]) -> str:
+        """Format elapsed seconds as a compact duration string."""
+        if seconds is None:
+            return "0s"
+        minutes, secs = divmod(max(0, int(seconds)), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h{minutes}m{secs}s"
+        if minutes:
+            return f"{minutes}m{secs}s"
+        return f"{secs}s"
+
+    @staticmethod
+    def _get_execution_tracker(
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> Optional[ExecutionTracker]:
+        tracker = context.bot_data.get("execution_tracker")
+        if isinstance(tracker, ExecutionTracker):
+            return tracker
+        return None
+
+    @staticmethod
+    async def _notify_busy(update: Update) -> None:
+        """Tell user another request is already running in this conversation."""
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "⏳ A Codex task is already running in this chat.\n"
+                "Use /status for live progress."
+            )
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -523,11 +555,11 @@ class MessageOrchestrator:
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Compact one-line status, no buttons."""
+        """Show compact status with live execution details when running."""
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        dir_display = str(current_dir)
+        dir_display = escape_html(str(current_dir))
 
         session_id = context.user_data.get("claude_session_id")
         session_status = "active" if session_id else "none"
@@ -544,9 +576,42 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
-        await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
-        )
+        lines = [
+            f"📂 <code>{dir_display}</code>",
+            f"🤖 Session: <b>{session_status}</b>{escape_html(cost_str)}",
+        ]
+
+        tracker = self._get_execution_tracker(context)
+        scope_key = scope_key_from_update(update)
+        if tracker and scope_key:
+            snap = tracker.get_snapshot(scope_key)
+            if snap.running:
+                elapsed = self._format_duration(snap.elapsed_seconds())
+                lines.append(f"⚙️ Activity: <b>running</b> ({elapsed})")
+                if snap.prompt_preview:
+                    lines.append(f"🧠 Task: {escape_html(snap.prompt_preview)}")
+                if snap.last_tool:
+                    tool_line = (
+                        f"🔧 Last tool: <code>{escape_html(snap.last_tool)}</code>"
+                    )
+                    if snap.tool_calls:
+                        tool_line += f" ({snap.tool_calls} calls)"
+                    lines.append(tool_line)
+                if snap.last_stream_preview:
+                    lines.append(
+                        f"📝 Stream: {escape_html(snap.last_stream_preview[-120:])}"
+                    )
+                if snap.last_stream_at_epoch is not None:
+                    age = max(0, int(time.time() - snap.last_stream_at_epoch))
+                    lines.append(f"⏱️ Last stream: {age}s ago")
+            else:
+                lines.append("⚙️ Activity: idle")
+                if snap.last_error:
+                    lines.append(f"⚠️ Last error: {escape_html(snap.last_error)}")
+        else:
+            lines.append("⚙️ Activity: idle")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -943,6 +1008,10 @@ class MessageOrchestrator:
                 await update.message.reply_text(f"⏱️ {limit_message}")
                 return
 
+        execution_tracker = self._get_execution_tracker(context)
+        scope_key = scope_key_from_update(update)
+        scope_lock: Optional[asyncio.Lock] = None
+
         chat = update.message.chat
         await chat.send_action("typing")
 
@@ -956,10 +1025,21 @@ class MessageOrchestrator:
             )
             return
 
+        if execution_tracker and scope_key:
+            scope_lock = execution_tracker.get_lock(scope_key)
+            if scope_lock.locked():
+                await progress_msg.delete()
+                await self._notify_busy(update)
+                return
+            await scope_lock.acquire()
+
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
         session_id = context.user_data.get("claude_session_id")
+        execution_tracker = self._get_execution_tracker(context)
+        scope_key = scope_key_from_update(update)
+        scope_lock: Optional[asyncio.Lock] = None
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
@@ -981,7 +1061,7 @@ class MessageOrchestrator:
                 throttle_interval=self.settings.stream_draft_interval,
             )
 
-        on_stream = self._make_stream_callback(
+        base_on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
             tool_log,
@@ -991,11 +1071,29 @@ class MessageOrchestrator:
             draft_streamer=draft_streamer,
         )
 
+        if execution_tracker and scope_key:
+
+            async def on_stream(update_obj: StreamUpdate) -> None:
+                execution_tracker.record_stream(scope_key, update_obj)
+                if base_on_stream:
+                    await base_on_stream(update_obj)
+
+        else:
+            on_stream = base_on_stream
+
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
 
         success = True
         try:
+            if execution_tracker and scope_key:
+                execution_tracker.start(
+                    scope_key,
+                    prompt=message_text,
+                    working_directory=str(current_dir),
+                    session_id=session_id,
+                )
+
             claude_response = await claude_integration.run_command(
                 prompt=message_text,
                 working_directory=current_dir,
@@ -1039,9 +1137,20 @@ class MessageOrchestrator:
             formatted_messages = formatter.format_claude_response(
                 claude_response.content
             )
+            if execution_tracker and scope_key:
+                execution_tracker.finish(
+                    scope_key,
+                    session_id=claude_response.session_id,
+                )
 
         except Exception as e:
             success = False
+            if execution_tracker and scope_key:
+                execution_tracker.finish(
+                    scope_key,
+                    session_id=session_id,
+                    error=str(e),
+                )
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
             from .handlers.message import _format_error_message
             from .utils.formatting import FormattedMessage
@@ -1056,6 +1165,8 @@ class MessageOrchestrator:
                     await draft_streamer.flush()
                 except Exception:
                     logger.debug("Draft flush failed in finally block", user_id=user_id)
+            if scope_lock and scope_lock.locked():
+                scope_lock.release()
 
         try:
             await progress_msg.delete()
@@ -1221,6 +1332,9 @@ class MessageOrchestrator:
             "current_directory", self.settings.approved_directory
         )
         session_id = context.user_data.get("claude_session_id")
+        execution_tracker = self._get_execution_tracker(context)
+        scope_key = scope_key_from_update(update)
+        scope_lock: Optional[asyncio.Lock] = None
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
@@ -1229,7 +1343,7 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_doc: List[ImageAttachment] = []
-        on_stream = self._make_stream_callback(
+        base_on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
             tool_log,
@@ -1238,8 +1352,35 @@ class MessageOrchestrator:
             approved_directory=self.settings.approved_directory,
         )
 
+        if execution_tracker and scope_key:
+
+            async def on_stream(update_obj: StreamUpdate) -> None:
+                execution_tracker.record_stream(scope_key, update_obj)
+                if base_on_stream:
+                    await base_on_stream(update_obj)
+
+        else:
+            on_stream = base_on_stream
+
         heartbeat = self._start_typing_heartbeat(chat)
         try:
+            if execution_tracker and scope_key:
+                scope_lock = execution_tracker.get_lock(scope_key)
+                if scope_lock.locked():
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        logger.debug("Failed to delete progress message, ignoring")
+                    await self._notify_busy(update)
+                    return
+                await scope_lock.acquire()
+                execution_tracker.start(
+                    scope_key,
+                    prompt=prompt or "",
+                    working_directory=str(current_dir),
+                    session_id=session_id,
+                )
+
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
                 working_directory=current_dir,
@@ -1248,6 +1389,12 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
             )
+
+            if execution_tracker and scope_key:
+                execution_tracker.finish(
+                    scope_key,
+                    session_id=claude_response.session_id,
+                )
 
             if force_new:
                 context.user_data["force_new_session"] = False
@@ -1314,12 +1461,20 @@ class MessageOrchestrator:
                         logger.warning("Image send failed", error=str(img_err))
 
         except Exception as e:
+            if execution_tracker and scope_key:
+                execution_tracker.finish(
+                    scope_key,
+                    session_id=session_id,
+                    error=str(e),
+                )
             from .handlers.message import _format_error_message
 
             await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
         finally:
             heartbeat.cancel()
+            if scope_lock and scope_lock.locked():
+                scope_lock.release()
 
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1424,11 +1579,14 @@ class MessageOrchestrator:
         )
         session_id = context.user_data.get("claude_session_id")
         force_new = bool(context.user_data.get("force_new_session"))
+        execution_tracker = self._get_execution_tracker(context)
+        scope_key = scope_key_from_update(update)
+        scope_lock: Optional[asyncio.Lock] = None
 
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_media: List[ImageAttachment] = []
-        on_stream = self._make_stream_callback(
+        base_on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
             tool_log,
@@ -1437,8 +1595,35 @@ class MessageOrchestrator:
             approved_directory=self.settings.approved_directory,
         )
 
+        if execution_tracker and scope_key:
+
+            async def on_stream(update_obj: StreamUpdate) -> None:
+                execution_tracker.record_stream(scope_key, update_obj)
+                if base_on_stream:
+                    await base_on_stream(update_obj)
+
+        else:
+            on_stream = base_on_stream
+
         heartbeat = self._start_typing_heartbeat(chat)
         try:
+            if execution_tracker and scope_key:
+                scope_lock = execution_tracker.get_lock(scope_key)
+                if scope_lock.locked():
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        logger.debug("Failed to delete progress message, ignoring")
+                    await self._notify_busy(update)
+                    return
+                await scope_lock.acquire()
+                execution_tracker.start(
+                    scope_key,
+                    prompt=prompt,
+                    working_directory=str(current_dir),
+                    session_id=session_id,
+                )
+
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
                 working_directory=current_dir,
@@ -1447,8 +1632,23 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
             )
+            if execution_tracker and scope_key:
+                execution_tracker.finish(
+                    scope_key,
+                    session_id=claude_response.session_id,
+                )
+        except Exception as e:
+            if execution_tracker and scope_key:
+                execution_tracker.finish(
+                    scope_key,
+                    session_id=session_id,
+                    error=str(e),
+                )
+            raise
         finally:
             heartbeat.cancel()
+            if scope_lock and scope_lock.locked():
+                scope_lock.release()
 
         if force_new:
             context.user_data["force_new_session"] = False

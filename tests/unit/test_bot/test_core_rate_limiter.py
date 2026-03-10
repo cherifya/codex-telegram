@@ -21,6 +21,7 @@ def bot_with_builder(monkeypatch):
     bot = ClaudeCodeBot(settings, deps)
 
     builder = MagicMock()
+    builder.concurrent_updates.return_value = builder
     builder.token.return_value = builder
     builder.rate_limiter.return_value = builder
     builder.connect_timeout.return_value = builder
@@ -64,6 +65,7 @@ async def test_initialize_sets_aioratelimiter_with_single_retry(bot_with_builder
     limiter = builder.rate_limiter.call_args.args[0]
     assert isinstance(limiter, AIORateLimiter)
     assert limiter._max_retries == 1
+    builder.concurrent_updates.assert_called_once_with(16)
 
 
 @pytest.mark.asyncio

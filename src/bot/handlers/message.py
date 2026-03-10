@@ -19,6 +19,7 @@ from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.rate_limiter import RateLimiter
 from ...security.validators import SecurityValidator
+from ..execution_tracker import ExecutionTracker, scope_key_from_update
 from ..utils.html_format import escape_html
 from ..utils.image_extractor import (
     ImageAttachment,
@@ -343,6 +344,23 @@ async def handle_text_message(
             )
             return
 
+        execution_tracker = context.bot_data.get("execution_tracker")
+        scope_key = scope_key_from_update(update)
+        scope_lock: Optional[asyncio.Lock] = None
+        if isinstance(execution_tracker, ExecutionTracker) and scope_key:
+            scope_lock = execution_tracker.get_lock(scope_key)
+            if scope_lock.locked():
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    logger.debug("Failed to delete progress message, ignoring")
+                await update.message.reply_text(
+                    "⏳ A Codex task is already running in this chat.\n"
+                    "Use /status for live progress."
+                )
+                return
+            await scope_lock.acquire()
+
         # Get current directory
         current_dir = context.user_data.get(
             "current_directory", settings.approved_directory
@@ -360,6 +378,9 @@ async def handle_text_message(
 
         # Enhanced stream updates handler with progress tracking
         async def stream_handler(update_obj):
+            if isinstance(execution_tracker, ExecutionTracker) and scope_key:
+                execution_tracker.record_stream(scope_key, update_obj)
+
             # Intercept send_image_to_user MCP tool calls.
             # The SDK namespaces MCP tools as "mcp__<server>__<tool>".
             if update_obj.tool_calls:
@@ -386,6 +407,14 @@ async def handle_text_message(
 
         # Run Claude command
         try:
+            if isinstance(execution_tracker, ExecutionTracker) and scope_key:
+                execution_tracker.start(
+                    scope_key,
+                    prompt=message_text,
+                    working_directory=str(current_dir),
+                    session_id=session_id,
+                )
+
             claude_response = await claude_integration.run_command(
                 prompt=message_text,
                 working_directory=current_dir,
@@ -394,6 +423,12 @@ async def handle_text_message(
                 on_stream=stream_handler,
                 force_new=force_new,
             )
+
+            if isinstance(execution_tracker, ExecutionTracker) and scope_key:
+                execution_tracker.finish(
+                    scope_key,
+                    session_id=claude_response.session_id,
+                )
 
             # New session created successfully — clear the one-shot flag
             if force_new:
@@ -429,6 +464,12 @@ async def handle_text_message(
             )
 
         except Exception as e:
+            if isinstance(execution_tracker, ExecutionTracker) and scope_key:
+                execution_tracker.finish(
+                    scope_key,
+                    session_id=session_id,
+                    error=str(e),
+                )
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
             from ..utils.formatting import FormattedMessage
 
@@ -657,6 +698,14 @@ async def handle_text_message(
             )
 
         logger.error("Error processing text message", error=str(e), user_id=user_id)
+    finally:
+        if (
+            "scope_lock" in locals()
+            and scope_lock
+            and isinstance(scope_lock, asyncio.Lock)
+            and scope_lock.locked()
+        ):
+            scope_lock.release()
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

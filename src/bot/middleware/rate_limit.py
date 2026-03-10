@@ -6,6 +6,20 @@ import structlog
 
 logger = structlog.get_logger()
 
+# Commands that should bypass normal rate limiting so users can check
+# in-flight status while a long-running request is executing.
+_PRIORITY_COMMANDS = {"/status"}
+
+
+def _extract_command(event: Any) -> str:
+    """Return normalized command token (e.g. '/status'), or empty string."""
+    message = event.effective_message
+    text = (message.text or "").strip() if message else ""
+    if not text.startswith("/"):
+        return ""
+    token = text.split()[0].split("@", 1)[0].lower()
+    return token
+
 
 async def rate_limit_middleware(
     handler: Callable, event: Any, data: Dict[str, Any]
@@ -27,6 +41,17 @@ async def rate_limit_middleware(
 
     if not user_id:
         logger.warning("No user information in update")
+        return await handler(event, data)
+
+    # Let high-priority introspection commands run immediately even when
+    # the user is currently rate limited.
+    command = _extract_command(event)
+    if command in _PRIORITY_COMMANDS:
+        logger.debug(
+            "Skipping rate limit for priority command",
+            user_id=user_id,
+            command=command,
+        )
         return await handler(event, data)
 
     # Get dependencies from context

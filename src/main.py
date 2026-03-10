@@ -12,6 +12,7 @@ import structlog
 
 from src import __version__
 from src.bot.core import ClaudeCodeBot
+from src.bot.execution_tracker import ExecutionTracker
 from src.codex import (
     CodexIntegration,
     SessionManager,
@@ -152,6 +153,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     # --- Event bus and agentic platform components ---
     event_bus = EventBus()
+    execution_tracker = ExecutionTracker()
 
     # Event security middleware
     event_security = EventSecurityMiddleware(
@@ -180,6 +182,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "codex_integration": codex_integration,
         "storage": storage,
         "event_bus": event_bus,
+        "execution_tracker": execution_tracker,
         "project_registry": None,
         "project_threads_manager": None,
     }

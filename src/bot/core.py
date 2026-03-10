@@ -50,6 +50,9 @@ class ClaudeCodeBot:
 
         # Create application
         builder = Application.builder()
+        # Allow /status and other lightweight commands to run while a long Codex
+        # request is in-flight.
+        builder.concurrent_updates(16)
         builder.token(self.settings.telegram_token_str)
         builder.defaults(Defaults(do_quote=self.settings.reply_quote))
         builder.rate_limiter(AIORateLimiter(max_retries=1))

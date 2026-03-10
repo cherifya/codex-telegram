@@ -189,6 +189,24 @@ class TestMiddlewareBlocksSubsequentGroups:
         with pytest.raises(ApplicationHandlerStop):
             await wrapper(mock_update, mock_context)
 
+    async def test_status_command_bypasses_rate_limit(
+        self, bot, mock_update, mock_context
+    ):
+        """Priority /status command should skip rate limit checks."""
+        from src.bot.middleware.rate_limit import rate_limit_middleware
+
+        mock_update.effective_message.text = "/status"
+        rate_limiter = MagicMock()
+        rate_limiter.check_rate_limit = AsyncMock(
+            return_value=(False, "Rate limit exceeded")
+        )
+        bot.deps["rate_limiter"] = rate_limiter
+
+        wrapper = bot._create_middleware_handler(rate_limit_middleware)
+        await wrapper(mock_update, mock_context)
+
+        rate_limiter.check_rate_limit.assert_not_called()
+
     async def test_dependencies_injected_before_middleware_runs(
         self, bot, mock_update, mock_context
     ):

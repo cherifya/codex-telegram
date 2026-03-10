@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.bot.execution_tracker import ExecutionTracker, scope_key_from_update
 from src.bot.orchestrator import MessageOrchestrator, _redact_secrets
 from src.claude.sdk_integration import StreamUpdate
 from src.config import create_test_config
@@ -249,11 +250,15 @@ async def test_agentic_new_resets_session(agentic_settings, deps):
 
 
 async def test_agentic_status_compact(agentic_settings, deps):
-    """Agentic /status returns compact one-line status."""
+    """Agentic /status includes compact status lines."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.effective_chat.id = 456
+    update.effective_chat.is_forum = False
+    update.effective_message = update.message
+    update.message.message_thread_id = None
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
@@ -264,7 +269,53 @@ async def test_agentic_status_compact(agentic_settings, deps):
 
     call_args = update.message.reply_text.call_args
     text = call_args.args[0]
-    assert "Session: none" in text
+    assert "Session: <b>none</b>" in text
+    assert "Activity: idle" in text
+    assert call_args.kwargs.get("parse_mode") == "HTML"
+
+
+async def test_agentic_status_shows_running_execution(agentic_settings, deps):
+    """Agentic /status surfaces in-flight tracker details."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.effective_chat.id = 456
+    update.effective_chat.is_forum = False
+    update.effective_message = update.message
+    update.message.message_thread_id = None
+    update.message.reply_text = AsyncMock()
+
+    tracker = ExecutionTracker()
+    scope_key = scope_key_from_update(update)
+    assert scope_key is not None
+    tracker.start(
+        scope_key,
+        prompt="Investigate cron wiring in production",
+        working_directory="/tmp/project",
+        session_id="thread-1",
+    )
+    tracker.record_stream(
+        scope_key,
+        StreamUpdate(
+            type="assistant",
+            tool_calls=[{"name": "Read", "input": {"path": "cron.ts"}}],
+        ),
+    )
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "rate_limiter": None,
+        "execution_tracker": tracker,
+    }
+
+    await orchestrator.agentic_status(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "Activity: <b>running</b>" in text
+    assert "Task: Investigate cron wiring in production" in text
+    assert "Last tool: <code>Read</code>" in text
 
 
 async def test_agentic_text_calls_claude(agentic_settings, deps):

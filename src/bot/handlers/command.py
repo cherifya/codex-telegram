@@ -2,6 +2,7 @@
 
 import os
 import signal
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,7 @@ from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...storage.models import SessionModel
+from ..execution_tracker import ExecutionTracker, scope_key_from_update
 from ..utils.html_format import escape_html
 
 logger = structlog.get_logger()
@@ -919,6 +921,37 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif resumable_info:
         status_lines.append(resumable_info)
         status_lines.append("💡 Session will auto-resume on your next message")
+
+    tracker = context.bot_data.get("execution_tracker")
+    scope_key = scope_key_from_update(update)
+    if isinstance(tracker, ExecutionTracker) and scope_key:
+        snap = tracker.get_snapshot(scope_key)
+        if snap.running:
+            elapsed_seconds = snap.elapsed_seconds() or 0
+            minutes, seconds = divmod(elapsed_seconds, 60)
+            if minutes:
+                elapsed = f"{minutes}m{seconds}s"
+            else:
+                elapsed = f"{seconds}s"
+            status_lines.append(f"⚙️ Activity: <b>running</b> ({elapsed})")
+            if snap.prompt_preview:
+                status_lines.append(f"🧠 Task: {escape_html(snap.prompt_preview)}")
+            if snap.last_tool:
+                tool_line = f"🔧 Last tool: <code>{escape_html(snap.last_tool)}</code>"
+                if snap.tool_calls:
+                    tool_line += f" ({snap.tool_calls} calls)"
+                status_lines.append(tool_line)
+            if snap.last_stream_preview:
+                status_lines.append(
+                    f"📝 Stream: {escape_html(snap.last_stream_preview[-120:])}"
+                )
+            if snap.last_stream_at_epoch is not None:
+                age = max(0, int(time.time() - snap.last_stream_at_epoch))
+                status_lines.append(f"⏱️ Last stream: {age}s ago")
+        else:
+            status_lines.append("⚙️ Activity: idle")
+            if snap.last_error:
+                status_lines.append(f"⚠️ Last error: {escape_html(snap.last_error)}")
 
     # Add action buttons
     keyboard = []
