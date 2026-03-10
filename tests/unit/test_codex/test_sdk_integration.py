@@ -8,7 +8,12 @@ from unittest.mock import patch
 import pytest
 
 from src.claude.exceptions import ClaudeProcessError, ClaudeTimeoutError
-from src.claude.sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
+from src.claude.sdk_integration import (
+    _SUBPROCESS_STREAM_LIMIT,
+    ClaudeResponse,
+    ClaudeSDKManager,
+    StreamUpdate,
+)
 from src.config.settings import Settings
 
 
@@ -40,6 +45,16 @@ class _MockProcess:
 
     def kill(self) -> None:
         self.returncode = -9
+
+
+class _RaisingStream:
+    """Async stream that always raises the configured exception."""
+
+    def __init__(self, error: Exception):
+        self._error = error
+
+    async def readline(self) -> bytes:
+        raise self._error
 
 
 @pytest.fixture
@@ -156,6 +171,29 @@ class TestCodexBackedClaudeSDKManager:
         assert "--sandbox" in called_cmd
         assert "workspace-write" in called_cmd
 
+    async def test_execute_command_sets_larger_stream_limit(
+        self, manager: ClaudeSDKManager
+    ):
+        captured_kwargs = {}
+
+        async def _create_process(*cmd, **kwargs):
+            captured_kwargs.update(kwargs)
+            return _MockProcess(
+                stdout_lines=[b'{"type":"response.output_text.delta","delta":"ok"}\n'],
+                returncode=0,
+            )
+
+        with patch(
+            "src.claude.sdk_integration.asyncio.create_subprocess_exec",
+            side_effect=_create_process,
+        ):
+            await manager.execute_command(
+                prompt="hello",
+                working_directory=Path("/tmp"),
+            )
+
+        assert captured_kwargs.get("limit") == _SUBPROCESS_STREAM_LIMIT
+
     async def test_execute_command_stream_callback(self, manager: ClaudeSDKManager):
         updates = []
 
@@ -205,6 +243,28 @@ class TestCodexBackedClaudeSDKManager:
                 )
 
         assert "not logged in" in str(exc_info.value).lower()
+
+    async def test_readline_limit_error_mapped_to_process_error(
+        self, manager: ClaudeSDKManager
+    ):
+        async def _create_process(*cmd, **kwargs):
+            process = _MockProcess(stdout_lines=[], stderr_lines=[], returncode=1)
+            process.stdout = _RaisingStream(
+                ValueError("Separator is not found, and chunk exceed the limit")
+            )
+            return process
+
+        with patch(
+            "src.claude.sdk_integration.asyncio.create_subprocess_exec",
+            side_effect=_create_process,
+        ):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await manager.execute_command(
+                    prompt="show me everything",
+                    working_directory=Path("/tmp"),
+                )
+
+        assert "oversized output line" in str(exc_info.value).lower()
 
     async def test_nonzero_exit_with_assistant_content_is_nonfatal(
         self, manager: ClaudeSDKManager

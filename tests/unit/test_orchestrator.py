@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.bot.orchestrator import MessageOrchestrator, _redact_secrets
+from src.claude.sdk_integration import StreamUpdate
 from src.config import create_test_config
 
 
@@ -709,6 +710,39 @@ class TestTypingHeartbeat:
 
         sig = inspect.signature(orchestrator._make_stream_callback)
         assert "chat" not in sig.parameters
+
+
+class TestStreamDeltaPreview:
+    """Verify streamed Codex text is shown in progress updates."""
+
+    async def test_stream_delta_updates_progress_preview(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        progress_msg = AsyncMock()
+        callback = orchestrator._make_stream_callback(
+            verbose_level=1,
+            progress_msg=progress_msg,
+            tool_log=[],
+            start_time=0.0,
+        )
+        assert callback is not None
+
+        await callback(StreamUpdate(type="stream_delta", content="hello world"))
+
+        progress_msg.edit_text.assert_awaited_once()
+        rendered = progress_msg.edit_text.call_args.args[0]
+        assert "Response (live preview):" in rendered
+        assert "hello world" in rendered
+
+    def test_merge_stream_delta_handles_cumulative_chunks(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        merged = orchestrator._merge_stream_delta("hello", "hello world")
+        assert merged == "hello world"
+
+    def test_merge_stream_delta_avoids_full_duplicate(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        merged = orchestrator._merge_stream_delta("hello world", "world")
+        assert merged == "hello world"
 
 
 async def test_group_thread_mode_rejects_non_forum_chat(group_thread_settings, deps):

@@ -31,6 +31,7 @@ from telegram.ext import (
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
+from ..utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
@@ -107,6 +108,17 @@ _TOOL_ICONS: Dict[str, str] = {
 def _tool_icon(name: str) -> str:
     """Return emoji for a tool, with a default wrench."""
     return _TOOL_ICONS.get(name, "\U0001f527")
+
+
+def _tail_ellipsize(text: str, max_len: int) -> str:
+    """Tail-truncate text with an ellipsis when over ``max_len``."""
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len == 1:
+        return "\u2026"
+    return "\u2026" + text[-(max_len - 1) :]
 
 
 class MessageOrchestrator:
@@ -583,36 +595,71 @@ class MessageOrchestrator:
         activity_log: List[Dict[str, Any]],
         verbose_level: int,
         start_time: float,
+        live_response_preview: Optional[str] = None,
     ) -> str:
         """Build the progress message text based on activity so far."""
         if not activity_log:
-            return "Working..."
+            base_text = "Working..."
+        else:
+            elapsed = time.time() - start_time
+            lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
 
-        elapsed = time.time() - start_time
-        lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
-
-        for entry in activity_log[-15:]:  # Show last 15 entries max
-            kind = entry.get("kind", "tool")
-            if kind == "text":
-                # Claude's intermediate reasoning/commentary
-                snippet = entry.get("detail", "")
-                if verbose_level >= 2:
-                    lines.append(f"\U0001f4ac {snippet}")
+            for entry in activity_log[-15:]:  # Show last 15 entries max
+                kind = entry.get("kind", "tool")
+                if kind == "text":
+                    # Claude's intermediate reasoning/commentary
+                    snippet = entry.get("detail", "")
+                    if verbose_level >= 2:
+                        lines.append(f"\U0001f4ac {snippet}")
+                    else:
+                        # Level 1: one short line
+                        lines.append(f"\U0001f4ac {snippet[:80]}")
                 else:
-                    # Level 1: one short line
-                    lines.append(f"\U0001f4ac {snippet[:80]}")
-            else:
-                # Tool call
-                icon = _tool_icon(entry["name"])
-                if verbose_level >= 2 and entry.get("detail"):
-                    lines.append(f"{icon} {entry['name']}: {entry['detail']}")
-                else:
-                    lines.append(f"{icon} {entry['name']}")
+                    # Tool call
+                    icon = _tool_icon(entry["name"])
+                    if verbose_level >= 2 and entry.get("detail"):
+                        lines.append(f"{icon} {entry['name']}: {entry['detail']}")
+                    else:
+                        lines.append(f"{icon} {entry['name']}")
 
-        if len(activity_log) > 15:
-            lines.insert(1, f"... ({len(activity_log) - 15} earlier entries)\n")
+            if len(activity_log) > 15:
+                lines.insert(1, f"... ({len(activity_log) - 15} earlier entries)\n")
 
-        return "\n".join(lines)
+            base_text = "\n".join(lines)
+
+        if not live_response_preview:
+            return _tail_ellipsize(base_text, TELEGRAM_MAX_MESSAGE_LENGTH)
+
+        heading = "\n\nResponse (live preview):\n"
+        available = TELEGRAM_MAX_MESSAGE_LENGTH - len(base_text) - len(heading)
+        if available <= 0:
+            return _tail_ellipsize(base_text, TELEGRAM_MAX_MESSAGE_LENGTH)
+
+        response_preview = _tail_ellipsize(live_response_preview, available)
+        return f"{base_text}{heading}{response_preview}"
+
+    @staticmethod
+    def _merge_stream_delta(current: str, chunk: str) -> str:
+        """Merge a streamed chunk into accumulated text without obvious duplicates.
+
+        Handles both token deltas (append) and cumulative chunks
+        (replace/overlap) emitted by different Codex versions.
+        """
+        if not chunk:
+            return current
+        if not current:
+            return chunk
+        if chunk.startswith(current):
+            return chunk
+        if current.endswith(chunk):
+            return current
+
+        max_overlap = min(len(current), len(chunk), 256)
+        for overlap in range(max_overlap, 0, -1):
+            if current[-overlap:] == chunk[:overlap]:
+                return current + chunk[overlap:]
+
+        return current + chunk
 
     @staticmethod
     def _summarize_tool_input(tool_name: str, tool_input: Dict[str, Any]) -> str:
@@ -699,6 +746,7 @@ class MessageOrchestrator:
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
+        streamed_response = [""]
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
             # Intercept send_image_to_user MCP tool calls.
@@ -755,14 +803,28 @@ class MessageOrchestrator:
             if draft_streamer and update_obj.content:
                 if update_obj.type == "stream_delta":
                     await draft_streamer.append_text(update_obj.content)
+            elif (
+                not draft_streamer
+                and verbose_level >= 1
+                and update_obj.type == "stream_delta"
+                and update_obj.content
+            ):
+                streamed_response[0] = self._merge_stream_delta(
+                    streamed_response[0], update_obj.content
+                )
 
             # Throttle progress message edits to avoid Telegram rate limits
             if not draft_streamer and verbose_level >= 1:
                 now = time.time()
-                if (now - last_edit_time[0]) >= 2.0 and tool_log:
+                if (now - last_edit_time[0]) >= 2.0 and (
+                    tool_log or streamed_response[0]
+                ):
                     last_edit_time[0] = now
                     new_text = self._format_verbose_progress(
-                        tool_log, verbose_level, start_time
+                        tool_log,
+                        verbose_level,
+                        start_time,
+                        live_response_preview=streamed_response[0],
                     )
                     try:
                         await progress_msg.edit_text(new_text)

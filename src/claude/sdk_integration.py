@@ -23,6 +23,11 @@ from .monitor import check_bash_directory_boundary
 
 logger = structlog.get_logger()
 
+# Default asyncio StreamReader limit is 64 KiB, which can fail on large
+# single-line JSON events/tool output with:
+# "Separator is not found, and chunk exceed the limit".
+_SUBPROCESS_STREAM_LIMIT = 8 * 1024 * 1024  # 8 MiB
+
 
 @dataclass
 class ClaudeResponse:
@@ -154,6 +159,7 @@ class ClaudeSDKManager:
                     env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    limit=_SUBPROCESS_STREAM_LIMIT,
                 )
             except FileNotFoundError as e:
                 raise ClaudeProcessError(
@@ -203,10 +209,23 @@ class ClaudeSDKManager:
                     if text:
                         state["stderr_lines"].append(text)
 
-            await asyncio.wait_for(
-                asyncio.gather(_read_stdout(), _read_stderr(), process.wait()),
-                timeout=self.config.claude_timeout_seconds,
-            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(_read_stdout(), _read_stderr(), process.wait()),
+                    timeout=self.config.claude_timeout_seconds,
+                )
+            except ValueError as e:
+                err_text = str(e)
+                if (
+                    "Separator is not found" in err_text
+                    and "chunk exceed the limit" in err_text
+                ):
+                    raise ClaudeProcessError(
+                        "Codex produced an oversized output line that exceeded the "
+                        "stream reader limit. Please retry with a narrower scope "
+                        "(smaller files/outputs) if this persists."
+                    ) from e
+                raise
 
             duration_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
 
